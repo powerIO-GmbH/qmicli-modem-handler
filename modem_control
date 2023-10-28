@@ -1,0 +1,1607 @@
+#!/bin/bash
+# shellcheck disable=SC2155
+
+declare DEBUG=0                               # 1 to enable debug, 0 to disable
+declare DEBUG_LOG_AS_JSON=0                   # 1 to log as json, 0 to log as text
+declare LOG_FILE="/var/log/modem_control.log" # log file
+
+readonly DEVICE_PATH="/dev/cdc-wdm0" # cdc device to control modem
+readonly VENDOR_ID_MODEM="1508"      # vendor id of the modem
+readonly DELAY_TIME_ITF_CHANGE=2     # seconds of delay after interface change up/down
+declare STATE_DIR="/tmp/modem_control"
+declare LOCK_FILE="${STATE_DIR}/active_execution.lock" # used for every qmicli call
+
+readonly MAX_WAIT_TIME=40
+readonly MODEM_HELPER_SOURCE="/usr/powerio/sbin/modem_helper"
+
+
+# load helper functions script
+if [[ ! -f "$MODEM_HELPER_SOURCE" ]]; then
+    echo "modem_helper not found"
+    exit 1
+else
+    source "$MODEM_HELPER_SOURCE"
+fi
+
+# Check if the required commands are installed
+if [[ ! $(command -v jq) ]]; then
+    log_msg "error" "jq is not installed"
+    exit 1
+fi
+
+# Create state dir if it does not exist
+if [[ ! -d $STATE_DIR ]]; then
+    mkdir -p $STATE_DIR
+fi
+
+
+### SECTION INTERFACE CONTROL ###
+
+# Get the interface by which the modem is connected
+# The information is obtained from the modem cdc itself
+# 
+# Return: JSON object with the following keys:
+#   - used_interface: interface name
+function _get_itf() {
+    result=$(exec_qmi_cmd 10 0 --get-wwan-iface)
+    used_interface=$result
+    create_json_structure "$(add_json_string_attribute "used_interface" "$used_interface")"
+}
+
+# Get the interface in blank format by 'calling _get_itf'
+#
+# Return: interface name (blank)
+function _get_itf_name() {
+    interface_json=$(_get_itf)
+    interface="$(parse_json_attribute "$interface_json" "used_interface")"
+    echo $interface
+}
+
+# Check if the interface is available in the system
+#
+# Return: JSON object with the following keys:
+#   - interface_available: true/false
+#   - sys_path: path to the interface in the system
+function _check_itf_available() {
+    local interface_name=$(_get_itf_name)
+    local sys_path_value=""
+    local interface_available_value="false"
+    if [[ -d "/sys/class/net/$interface_name" ]]; then
+        sys_path_value="/sys/class/net/$interface_name"
+        interface_available_value="true"
+    fi
+    create_json_structure \
+        "$(add_json_string_attribute "interface_available" "$interface_available_value")" \
+        "$(add_json_string_attribute "sys_path" "$sys_path_value")"
+}
+
+# Check if the interface is up
+#
+# Return: JSON object with the following keys:
+#   - interface_up: true/false
+function _check_itf_up() {
+    local interface_sys_path="$(parse_json_attribute "$(_check_itf_available)" "sys_path")"
+    local flags_hex=$(cat "$interface_sys_path/flags" | tr -d '[:space:]')
+    flags_hex=${flags_hex#0x}
+    local is_up=$((0x$flags_hex & 0x1))
+    interface_up=$([ "$is_up" -eq 1 ] && echo "true" || echo "false")
+    create_json_structure "$(add_json_string_attribute "interface_up" "$interface_up")"
+
+}
+
+# Set the interface state to up or down
+#
+# Params:
+#   - $1 state: up/down
+function _set_itf_state() {
+    local state="$1"
+    local interface_name=$(_get_itf_name)
+    local command="ip link set $interface_name"
+
+    log_msg "info" "Setting interface $interface_name to $state"
+    if [[ "$state" == "up" || "$state" == "down" ]]; then
+        $command $state
+        sleep $DELAY_TIME_ITF_CHANGE
+        log_msg "info" "Interface $interface_name is now $state"
+    else
+        log_msg "error" "Invalid state: $state"
+        exit 1
+    fi
+}
+
+# Set the interface mode to raw_ip
+function _set_raw_mode() {
+    local interface_name=$(_get_itf_name)
+    echo '1' | sudo tee /sys/class/net/$interface_name/qmi/raw_ip &>/dev/null
+}
+
+function _check_itf_assigned_inet() {
+    local interface_name=$(_get_itf_name)
+    local inet_line="$(ip addr show $interface_name | grep "inet ")"
+
+    if [[ -n $inet_line ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function _get_assigned_itf_inet() {
+    local interface_name=$(_get_itf_name)
+    local inet_line="$(ip addr show $interface_name | grep "inet ")"
+    echo $inet_line | awk '{print $2}' | sed 's/\/[0-9]*//'
+}
+
+### END SECTION INTERFACE CONTROL ###
+
+### SECTION NETWORK IDs PERSISTENCE HANDLING ###
+
+# Cleanup all network ids
+# This is usualy called when the modem is reset
+function _cleanup_network_ids() {
+    rm -rf ${STATE_DIR}/network_ids || true
+}
+
+# Save network ids to a file.
+# Every key will create a file and the value will be the content.
+#
+# Params:
+#    - $1: Simple json object with "<key>":"<value>" pairs
+#
+# Return: none
+function _save_network_ids() {
+    local json_object="$1"
+    local dir_path="${STATE_DIR}/network_ids"
+
+    if [[ ! -d $dir_path ]]; then
+        mkdir -p $dir_path
+    fi
+
+    local keys=$(echo "$json_object" | jq -r 'keys[]')
+
+    for key in $keys; do
+        local value=$(parse_json_attribute "$json_object" "$key")
+        local file_path="${dir_path}/$key"
+        if [[ -f $file_path ]]; then
+            log_msg "info" "File $file_path already exists. Overwriting..."
+        fi
+        echo "$value" >"$file_path"
+    done
+}
+
+# Get network ids from a file
+# 
+# Return:
+#    -  a simple json object with "<key>":"<value>" pairs
+function _get_network_ids() {
+    local dir_path="${STATE_DIR}/network_ids"
+    local json_object=""
+
+    if [[ ! -d $dir_path ]]; then
+        log_msg "error" "No network ids found"
+        exit 1
+    fi
+    local single_json_obj=""
+    for file in $dir_path/*; do
+        local key=$(basename "$file")
+        local value=$(cat "$file")
+        single_json_obj+="$(create_json_structure \
+            "$(add_json_attribute "$key" "$value")")"
+        #json_object="$(add_json_attribute "$key" "$value") $json_object"
+    done
+    local value="$(combine_json_attributes_from_objs $single_json_obj)"
+    echo_json $value
+}
+
+### END SECTION NETWORK IDs PERSISTENCE HANDLING ###
+
+### SECTION OPERATING MODE HANDLING ###
+
+# Get the DMS operating mode of the modem
+#
+# Return: operating mode dms (blank)
+function _get_dms_operating_mode() {
+    local operating_mode="$(exec_qmi_cmd 10 0 --dms-get-operating-mode)"
+    local operating_mode="$(parse_qmicli_result "$operating_mode" "Mode")"
+    echo $operating_mode
+}
+
+# Get the WDS operating mode of the modem
+#
+# Return: operating mode wds (blank)
+function _get_wds_operating_mode() {
+    local wds_mode="$(exec_qmi_cmd 20 0 --wds-get-packet-service-status |
+        sed -n "s/.*Connection status: '\(.*\)'/\1/p")"
+    echo $wds_mode
+}
+
+# Set the device operating mode
+#
+# Params:
+#   - $1 mode: (online|low_power|offline|reset)
+#   - $2 delay_time: delay time after setting the mode
+# Return:
+#   - 0 if the mode is valid
+#   - 1 if the mode is invalid
+function _set_operating_mode() {
+    local mode="$1"
+    local delay_time=$2
+    if [[ ! $mode =~ ^(online|low-power|offline|reset)$ ]]; then
+        log_msg "error" "Invalid operating mode: $mode"
+        return 1
+    fi
+    if [[ -z $delay_time ]]; then
+        delay_time=2
+    fi
+    local result=$(exec_qmi_cmd 20 0 --dms-set-operating-mode $mode)
+    sleep $delay_time
+    echo $result
+    return 0
+}
+### END SECTION OPERATING MODE HANDLING ###
+
+### SECTION MODEM RESET HANDLING ###
+
+# Find the modem by vendor ID
+#
+# Params:
+#   - $1: vendor ID
+# Return: <vendor ID>:<product ID> of the modem (blank)
+function _find_modem_by_vendor_id() {
+    local search_vendor_id="$1"
+    local vendor_product_id=""
+
+    while IFS= read -r line; do
+        vendor_product_id=$(echo $line | awk '{print $6}')
+        echo "$vendor_product_id"
+        return 0
+    done < <(lsusb | grep "$search_vendor_id:")
+
+    return 1
+}
+
+# Reset the modem by resetting the USB device
+#
+function _reset_modem() {
+    local gpio_pin_reset=26
+
+    gpioset gpiochip0 $gpio_pin_reset=1
+    sleep 1
+    gpioset gpiochip0 $gpio_pin_reset=0
+    sleep 1
+}
+### END SECTION MODEM RESET HANDLING ###
+
+### SECTION MODEM INITIALIZATION HANDLING ###
+
+# Set initialized state of the modem and create state file
+#
+# Params:
+#   - $1: true/false
+function _set_initialization_state() {
+    local is_initialized="$1"
+    if [[ $is_initialized == "true" ]]; then
+        touch $STATE_DIR/device_initialized
+    else
+        rm -f $STATE_DIR/device_initialized
+    fi
+}
+
+# Check if the modem is initialized
+#
+# Return: 0 if the modem is initialized, 1 otherwise
+function _is_modem_initialized() {
+    if [ -f $STATE_DIR/device_initialized ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check if the modem is initialized
+#
+# Return: JSON object
+function _check_initialized() {
+    if ! _is_modem_initialized; then
+        local msg="modem not initialized yet, please call --init-modem first"
+        log_msg "error" "$msg"
+        local result="$(create_result "error" "$msg")"
+        create_json_return "$result"
+        exit 1
+    fi
+}
+### END SECTION MODEM INITIALIZATION HANDLING ###
+
+### SECTION SLOT,APP,PIN HANDLING ###
+
+# Get the ICCID of the SIM card
+#
+# Return: ICCID (blank)
+function _get_sim_iccid() {
+    local iccid_raw="$(exec_qmi_cmd 10 0 --uim-read-transparent=0x3F00,0x2FE2)"
+    local iccid_extracted="${iccid_raw#*Read result:}"
+    iccid_extracted="${iccid_extracted//[:[:space:]]/}"
+
+    # Split into 2-digit pairs and reverse each pair
+    local iccid=""
+    for ((i = 0; i < ${#iccid_extracted}; i += 2)); do
+        local pair="${iccid_extracted:$i:2}"
+        iccid+="${pair:1:1}${pair:0:1}"
+    done
+    local number=$(is_number $iccid)
+    [[ -n $number ]] && echo $number
+}
+
+# Get the IMSI of the SIM card
+#
+# Return: IMSI (blank)
+function _get_sim_imsi() {
+    local imsi=$(exec_qmi_cmd 20 0 --dms-uim-get-imsi)
+    imsi=$(parse_qmicli_result "$imsi" "IMSI")
+    local number=$(is_number $imsi)
+    [[ -n $number ]] && echo $number
+}
+
+# Check the Card state
+# This should also work if the application state is broken
+# (e.g. if the SIM card is removed during operation)
+#
+# Return: state (blank)
+# Posible values: (present|absent|possibly-removed|unknown)
+function _get_card_state() {
+    local info="$1"
+    local check_card_state="$(parse_qmicli_result "$info" "Card state")"
+    local sim_card_state
+    if [[ -n $check_card_state ]]; then
+        if [[ $check_card_state == "present" ]]; then
+            log_msg "info" "SIM card is present"
+        elif [[ $check_card_state == "absent" ]]; then
+            log_msg "info" "SIM card is absent"
+        elif [[ $check_card_state == *"possibly-removed"* ]]; then
+            # This could be the case if the SIM has removed during operation
+            log_msg "warning" "SIM card is possibly removed during operation"
+        else
+            log_msg "error" "SIM card state error"
+        fi
+        sim_card_state="$check_card_state"
+    else
+        log_msg "error" "Unable to get SIM card state"
+        sim_card_state="unknown"
+    fi
+
+    echo "$sim_card_state"
+}
+
+# Check the Slot and application state
+# 
+# param: info - qmicli output
+# Return: array
+# key 'state': (available|not-available)
+# key 'slot': slot number
+# key 'application': application number
+function _get_slot_app_state() {
+    local info="$1"
+    local check_app_slot="$(parse_qmicli_result "$info" "Primary GW")"
+    # we need to expect : Primary GW:   slot '1', application '1'
+    declare -A check_values
+    for key in slot application; do
+        if [[ $check_app_slot =~ $key[[:space:]]*([0-9]+) ]]; then
+            check_values[$key]="${BASH_REMATCH[1]}"
+        fi
+    done
+    local slot="${check_values[slot]}"
+    local application="${check_values[application]}"
+
+    if [[ -n $slot || -n $application ]]; then
+        log_msg "info" "SIM slot: $slot Application: $application"
+        echo "available"
+    else
+        log_msg "warning" "Unable to get SIM slot and application"
+        echo "unavailable"
+    fi
+}
+
+# Check the PIN state
+#
+# param:
+#   - info - qmicli output
+#   - pin_number - PIN number (1|2)
+# Return: state (blank)
+# Possible values: (not-initialized|enabled-not-verified|enabled-verified|disabled|blocked|permanently-blocked|unknown)
+function _get_PIN_state() {
+    local info="$1"
+    local pin_number="$2"
+
+    local number=$(is_number $pin_number)
+    if [[ -n $number ]]; then
+        if [[ $pin_number -gt 2 || $pin_number -lt 1 ]]; then
+            log_msg "error" "PIN number is invalid"
+            exit 1
+        fi
+    else
+        log_msg "error" "PIN number is not a number"
+        exit 1
+    fi
+
+    local check_pin_state="$(parse_qmicli_result "$info" "PIN${pin_number} state")"
+    echo "$check_pin_state"
+}
+
+# Get the application state
+#
+# param: info - qmicli output
+# Return: state (blank)
+function _get_application_state() {
+    local info="$1"
+
+    local check_application_state="$(parse_qmicli_result "$info" "Application state")"
+    echo "$check_application_state"
+}
+
+# Get the default profile number - we use the 3gpp profile as default.
+# It is used as the index for the profile list - We are using profiles for autoreconnect.
+#
+# Return: profile number (blank)
+function _get_default_profile_number() {
+    local default_profile="$(exec_qmi_cmd 10 0 --wds-get-default-profile-num=3gpp)"
+    local default_profile_number="$(parse_qmicli_result "$default_profile" "Default profile number")"
+    local number=$(is_number $default_profile_number)
+    [[ -n $number ]] && echo $number
+}
+
+# This function updates a profile with a given profile number, APN, and roaming setting,
+# as well as optional parameters for PDP type, username, password, authentication, and disabled status.
+# It constructs the command by adding each parameter only if it is set.
+#
+# Usage:
+# _update_profile \
+#     "profile_number=<profile_number>" \
+#     "apn=<apn>" \
+#     "roaming=<roaming>" \
+#     "pdp_type=<pdp_type>" \
+#     "username=<username>" \
+#     "password=<password>" \
+#     "auth=<auth>" \
+#     "disabled=<disabled>"
+#
+# Required Parameters:
+# - profile_number: The profile number
+# - apn: The Access Point Name
+# - no-roaming: The roaming setting
+#
+# Optional Parameters:
+# - pdp_type: The PDP type (IP|PPP|IPV6|IPV4V6)
+# - username: The username (username|leave blank if not required)
+# - password: The password  (password|leave blank if not required)
+# - auth: The authentication (NONE|PAP|CHAP|BOTH)
+# - no-roaming: The no-roaming setting (yes|no)
+# - disabled: The disabled (yes|no)
+function _update_profile() {
+    declare -A args
+    for kv in "$@"; do
+        IFS='=' read -r key value <<<"$kv"
+        args[$key]="$value"
+    done
+
+    local command="3gpp,${args[profile_number]},apn=${args[apn]}"
+
+    if [[ -n "${args[pdp_type]}" ]]; then
+        command+=",pdp-type=${args[pdp_type]}"
+    fi
+
+    if [[ -n "${args[username]}" ]]; then
+        command+=",username=${args[username]}"
+    fi
+
+    if [[ -n "${args[password]}" ]]; then
+        command+=",password=${args[password]}"
+    fi
+
+    if [[ -n "${args[auth]}" ]]; then
+        command+=",auth=${args[auth]}"
+    fi
+
+    command+=",no-roaming=${args[no-roaming]}"
+
+    if [[ -n "${args[disabled]}" ]]; then
+        command+=",disabled=${args[disabled]}"
+    fi
+
+    local profile_update="$(exec_qmi_cmd 10 0 --wds-modify-profile=$command)"
+}
+
+# This function gets the profile with a given profile number.
+# ATTENTION: Do not call this if we are already online and connected!
+#
+# Return: JSON object with following keys
+# - profile_apn: The Access Point Name
+# - profile_pdp_type: The PDP type (IP|PPP|IPV6|IPV4V6)
+# - profile_username: The username (username|leave blank if not required)
+# - profile_password: The password  (password|leave blank if not required)
+# - profile_auth: The authentication (NONE|PAP|CHAP|BOTH)
+# - profile_no_roaming: The no-roaming setting
+function _get_profile_settings() {
+    local profile="$(exec_qmi_cmd 40 1 --wds-get-default-settings=3gpp)"
+    cmd_has_error "$profile"
+    if [[ $? -eq 0 ]]; then
+        declare -A attributes
+        attributes[profile_apn]="APN"
+        attributes[profile_pdp_type]="PDP type"
+        attributes[profile_username]="Username"
+        attributes[profile_password]="Password"
+        attributes[profile_auth]="Auth"
+        attributes[profile_no_roaming]="Roaming"
+
+        local single_json_obj=""
+        for attribute in "${!attributes[@]}"; do
+            local item="$(parse_qmicli_result "$profile" "${attributes[$attribute]}")"
+            single_json_obj+="$(create_json_structure \
+                "$(add_json_string_attribute "$attribute" "$item")")"
+        done
+        result="$(create_result "success")"
+        local value="$(combine_json_attributes_from_objs $single_json_obj)"
+    else
+        result="$(create_result "error" "$profile")"
+    fi
+    create_json_return "$result" "$value"
+}
+### END SECTION SLOT,APP,PIN HANDLING ###
+
+### BEGIN SECTION HELPERS ###
+
+# Returns a simple result with given "type" and "message".
+# It also logs the message.
+#
+# Params:
+#   - $1: type (success|error|info)
+#   - $2: message
+function _invalid_input_msg() {
+    local type="$1"
+    local message="$2"
+    local result="$(create_result "$type" "$message")"
+    log_msg "$type" "$message"
+    create_json_return "$result"
+}
+
+# Returns a simple result with given "type" and "message".
+# It also logs the message and unlocks the process.
+# Note: Use this only if the process is locked.
+# Params:
+#   - $1: type (success|error|info)
+#   - $2: message
+#   - $3: skip_reset_init_state (optional)
+function _abort_handle() {
+    local type="$1"
+    local message="$2"
+    local skip_reset_init_state="$3"
+    _invalid_input_msg "$type" "$message"
+    if [[ -z "$skip_reset_init_state" ]]; then
+        _set_initialization_state false
+    fi
+    unlock_process
+}
+
+function _input_check_auth {
+    if [[ -z "$1" ]]; then
+        echo "NONE"
+    elif [[ "$1" == "NONE" || "$1" == "PAP" || "$1" == "CHAP" || "$1" == "BOTH" ]]; then
+        echo "$1"
+    else
+        exit 1
+    fi
+}
+### END SECTION HELPERS ###
+
+### BEGIN SECTION NETWORK AND CELLULAR HANDLING ###
+# Get full signal information
+# Return: JSON object with the following keys:
+#   - rssi: RSSI in dBm
+#   - rsrq: RSRQ in dB
+#   - rsrp: RSRP in dBm
+#   - snr: SNR in dB
+function _get_signal_info() {
+    local unit_dBm="dBm"
+    local unit_dB="dB"
+    local result="$(exec_qmi_cmd 10 1 --nas-get-signal-info)"
+    cmd_has_error $result
+    if [[ $? -eq 0 ]]; then
+        local rssi="$(parse_qmicli_result "$result" "RSSI" " $unit_dBm")"
+        local rsrq="$(parse_qmicli_result "$result" "RSRQ" " $unit_dB")"
+        local rsrp="$(parse_qmicli_result "$result" "RSRP" " $unit_dBm")"
+        local snr="$(parse_qmicli_result "$result" "SNR" " $unit_dB")"
+        if [ -n "$snr" ]; then
+            snr="$(printf "%.0f" "$snr")" # round SNR
+        fi
+        local rssi_json_obj="$(create_json_structure \
+            "$(add_json_attribute "value" "$rssi")" \
+            "$(add_json_string_attribute "unit" "$unit_dBm")")"
+        local rsrq_json_obj="$(create_json_structure \
+            "$(add_json_attribute "value" "$rsrq")" \
+            "$(add_json_string_attribute "unit" "$unit_dB")")"
+        local rsrp_json_obj="$(create_json_structure \
+            "$(add_json_attribute "value" "$rsrp")" \
+            "$(add_json_string_attribute "unit" "$unit_dBm")")"
+        local snr_json_obj="$(create_json_structure \
+            "$(add_json_attribute "value" "$snr")" \
+            "$(add_json_string_attribute "unit" "$unit_dB")")"
+
+        create_json_structure \
+            "$(add_json_object "rssi" "$rssi_json_obj")" \
+            "$(add_json_object "rsrq" "$rsrq_json_obj")" \
+            "$(add_json_object "rsrp" "$rsrp_json_obj")" \
+            "$(add_json_object "snr" "$snr_json_obj")"
+    else
+        create_json_structure \
+            "$(add_json_string_attribute "error" "$result")"
+    fi
+}
+
+# Get the current registration state
+#
+# Return: string with the registration state (registered, not-registered, searching, denied)
+function _get_registration_state() {
+    local registration="$(exec_qmi_cmd 10 0 --nas-get-serving-system)"
+    local registration="$(parse_qmicli_result "$registration" "Registration state")"
+    echo $registration
+}
+
+function _set_autoconnect() {
+    local state="$1"
+    local roaming="$2"
+
+    if [[ "$state" != "enabled" && "$state" != "disabled" && "$state" != "paused" ]]; then
+        return 1
+    fi
+    if [[ "$roaming" != "roaming-allowed" && "$roaming" != "home-only" ]]; then
+        return 1
+    fi
+
+    local autoconnect_settings="$(exec_qmi_cmd 10 1 --wds-set-autoconnect-settings=$state,$roaming)"
+    cmd_has_error "$autoconnect_settings"
+    if [[ $? -eq 0 ]]; then
+        return 0
+    else
+        return 1
+    fi 
+}
+
+# Start the network with the given profile id.
+# Save the WDS CID and the Packet data handle ID.
+#
+# Params:
+#   - $1 profile_id: profile id
+# Return: JSON object with the following keys:
+#   - wds_cid: WDS CID
+#   - phd: Packet data handle ID
+function _start_network() {
+    local profile_id="$1"
+
+    # Set interface raw mode
+    _set_itf_state "down"
+    _set_raw_mode
+    _set_itf_state "up"
+
+    local connection="$(exec_qmi_cmd 30 0 --wds-start-network=3gpp-profile=$profile_id --client-no-release-cid)"
+    local wds_cid="$(parse_qmicli_result "$connection" "CID")"
+    local phd="$(parse_qmicli_result "$connection" "Packet data handle")"
+
+    if [[ -n "$wds_cid" || -n "$phd" ]]; then
+        local cid_number=$(is_number $wds_cid)
+        if [[ -n $cid_number ]]; then
+            log_msg "info" "WDS CID for network is $wds_cid"
+        else
+            log_msg "error" "WDS CID for network is invalid"
+        fi
+        local phd_number=$(is_number $phd)
+        if [[ -n $phd_number ]]; then
+            log_msg "info" "Packet data handle for network is $phd"
+        else
+            log_msg "error" "Packet data handle for network is invalid"
+        fi
+    else
+        log_msg "error" "Invalid WDS CID or Packet data handle"
+    fi
+
+    local result
+    if [[ -n $cid_number && -n $phd_number ]]; then
+        result="$(create_result "success")"
+        log_msg "info" "Network started successfully"
+        local value="$(create_json_structure \
+            "$(add_json_attribute "wds_cid" "$wds_cid")" \
+            "$(add_json_attribute "phd" "$phd")")"
+
+        _save_network_ids "$value"
+    else
+        result="$(create_result "error")"
+        log_msg "error" "Failed to start network"
+        local value=""
+    fi
+
+    create_json_return "$result" "$value"
+}
+
+# Stop the network connection.
+# If the network is not stopped successfully, reset the operating mode to low-power and online.
+#
+# Return: JSON object with the following keys
+#   - operating_mode: operating mode
+function _stop_network() {
+
+    local fallback_op_mode=false
+    local result
+    network_ids=$(_get_network_ids)
+    if [[ -n "$network_ids" ]]; then
+        wds_cid="$(parse_json_attribute "$network_ids" "wds_cid")"
+        phd="$(parse_json_attribute "$network_ids" "phd")"
+
+        local disconnect="$(exec_qmi_cmd 30 1 --wds-stop-network="$phd" --client-cid="$wds_cid")"
+        cmd_has_error "$disconnect"
+        if [[ $? -eq 0 ]]; then
+            log_msg "info" "Network stopped successfully: $disconnect"
+            result="$(create_result "success" "Network stopped successfully")"
+            fallback_op_mode=false
+        else
+            log_msg "error" "Failed to stop network, try reset operating mode $disconnect"
+            result="$(create_result "error" "Failed to stop network, try teardown modem")"
+            fallback_op_mode=true
+        fi
+        _cleanup_network_ids
+    else
+        log_msg "info" "No network to stop, will reset operating mode instead"
+        result="$(create_result "success" "No network to stop, will reset operating mode instead")"
+        fallback_op_mode=true
+    fi
+
+    if [[ "$fallback_op_mode" = true ]]; then
+        _set_operating_mode "low-power" 2 &>/dev/null
+        _set_operating_mode "online" 2 &>/dev/null
+    fi
+
+    local op_mode="$(get_operating_mode)"
+    local op_mode_value="$(parse_json_attribute "$op_mode" "value")"
+    op_mode_value="$(parse_json_attribute "$op_mode_value" "$operating_mode")"
+
+    create_json_return "$result" "$op_mode_value"
+}
+
+### END BEGIN SECTION NETWORK AND CELLULAR HANDLING ###
+
+### PUBLIC FUNCTIONS ###
+
+# Get some device information parameters
+#
+# Return: JSON object with the following keys:
+#   - imei
+#   - manufacturer
+#   - model
+#   - revision
+#   - hw_revision
+#   - sw_version
+#   - operating_mode
+function get_device_info() {
+
+    local imei=$(exec_qmi_cmd 10 0 --dms-get-ids)
+    imei=$(parse_qmicli_result "$imei" "IMEI")
+
+    local manufacturer=$(exec_qmi_cmd 10 0 --dms-get-manufacturer)
+    manufacturer=$(parse_qmicli_result "$manufacturer" "Manufacturer")
+
+    local model=$(exec_qmi_cmd 10 0 --dms-get-model)
+    model=$(parse_qmicli_result "$model" "Model")
+
+    local revision=$(exec_qmi_cmd 10 0 --dms-get-revision)
+    revision=$(parse_qmicli_result "$revision" "Revision")
+
+    local hw_revision=$(exec_qmi_cmd 10 0 --dms-get-hardware-revision)
+    hw_revision=$(parse_qmicli_result "$hw_revision" "Revision")
+
+    local mode_value_json_obj=$(parse_json_attribute "$(get_operating_mode)" "value")
+    local mode=$(parse_json_attribute "$mode_value_json_obj" "operating_mode")
+
+    log_msg "info" "IMEI: $imei"
+    log_msg "info" "Manufacturer: $manufacturer"
+    log_msg "info" "Model: $model"
+    log_msg "info" "Revision: $revision"
+    log_msg "info" "HW Revision: $hw_revision"
+    log_msg "info" "Mode: $mode"
+
+    local result="$(create_result "success")"
+    local value="$(create_json_structure \
+        "$(add_json_string_attribute "imei" "$imei")" \
+        "$(add_json_string_attribute "manufacturer" "$manufacturer")" \
+        "$(add_json_string_attribute "model" "$model")" \
+        "$(add_json_string_attribute "revision" "$revision")" \
+        "$(add_json_string_attribute "hw_revision" "$hw_revision")" \
+        "$(add_json_string_attribute "operating_mode" "$mode")")"
+
+    create_json_return "$result" "$value"
+}
+
+# Get all information about the interface
+#
+# Return: JSON object with the following keys:
+#   - used_interface: interface name
+#   - interface_available: true/false
+#   - sys_path: path to the interface in the system
+#   - interface_up: true/false
+function get_itf_information() {
+    local get_itf_out="$(_get_itf)"
+    interface="$(parse_json_attribute "$get_itf_out" "used_interface")"
+    if [[ -n $interface ]]; then
+        log_msg "info" "Found Interface: $interface"
+        local check_itf_available_out=$(_check_itf_available)
+        local check_itf_up_out=$(_check_itf_up)
+
+        local result="$(create_result "success")"
+        local value="$(combine_json_attributes_from_objs \
+            $get_itf_out \
+            $check_itf_available_out \
+            $check_itf_up_out)"
+    else
+        log_msg "error" "Interface not found"
+        local result="$(create_result "error" "missing interface")"
+    fi
+    create_json_return "$result" "$value"
+}
+
+# Get some general sim data
+# Includes information, as the presence of the card and the pin state
+#
+# Return: JSON object with the following keys:
+#   - sim_card_state: (present|absent|possibly-removed|unknown)
+#   - slot_app_state: (available|not-available)
+#   - application_state: (ready|pin1-or-upin-pin-required|puk1-or-upin-puk-required)
+#   - pin1_state: (not-initialized|enabled-not-verified|enabled-verified|disabled|blocked|permanently-blocked|unknown)
+#   - imsi: IMSI
+#   - iccid: ICCID
+function get_sim_info() {
+    local info=$(exec_qmi_cmd 20 0 --uim-get-card-status)
+
+    local sim_card_state="$(_get_card_state "$info")"     # always a valid value
+    local slot_app_state="$(_get_slot_app_state "$info")" # array of slot, application and state
+
+    local result_state="error"
+    if [[ $slot_app_state == "available" ]]; then
+        if [[ $sim_card_state == "present" ]]; then
+            result_state="needs-configuration"
+            # We need a slot and a detected sim card to continue
+            local application_state application_state="$(_get_application_state "$info")"
+            if [[ $application_state == "ready" ]]; then
+                log_msg "info" "SIM application state is ready"
+                result_state="ready"
+            elif [[ $application_state == "pin1-or-upin-pin-required" ]]; then
+                log_msg "info" "SIM PIN is required"
+            elif [[ $application_state == "puk1-or-upin-puk-required" ]]; then
+                log_msg "info" "SIM PUK is required"
+            else
+                # Other states are not relevant for us, if SIM is blocked
+                # User is informed with the PIN state
+                log_msg "warning" "SIM application state is not ready, state: $application_state"
+            fi
+
+            local pin_state="$(_get_PIN_state "$info" "1")"
+        else
+            log_msg "error" "SIM card is not present, state: $sim_card_state"
+        fi
+    else
+        log_msg "error" "SIM slot and application state error, state: $slot_app_state"
+    fi
+
+    local imsi="$(_get_sim_imsi)"
+    local iccid="$(_get_sim_iccid)"
+
+    local result_message
+    if [[ $result_state == "error" ]]; then
+        application_state="unavailable"
+        pin_state="unavailable"
+        imsi="unavailable"
+        iccid="unavailable"
+        result_message="SIM Slot and Application state error"
+    elif [[ $result_state == "needs-configuration" ]]; then
+        result_message="SIM needs configuration: $application_state"
+    elif [[ $result_state == "ready" ]]; then
+        result_message="SIM is ready and can be used"
+    else
+        result_message="SIM state error"
+    fi
+
+    local result="$(create_result "$result_state" "$result_message")"
+    local value="$(create_json_structure \
+        "$(add_json_string_attribute "sim_card_state" "$sim_card_state")" \
+        "$(add_json_string_attribute "slot_app_state" "$slot_app_state")" \
+        "$(add_json_string_attribute "application_state" "$application_state")" \
+        "$(add_json_string_attribute "pin1_state" "$pin_state")" \
+        "$(add_json_string_attribute "imsi" "$imsi")" \
+        "$(add_json_string_attribute "iccid" "$iccid")")"
+
+    create_json_return "$result" "$value"
+}
+
+# Get the current network settings
+# Return: JSON object with the following keys:
+#   - ip_family
+#   - ip
+#   - subnet
+#   - gateway
+#   - dns_primary
+#   - dns_secondary
+#   - mtu
+#   - domains
+function get_network_settings() {
+    local settings="$(exec_qmi_cmd 10 1 --wds-get-current-settings)"
+
+    local result
+    cmd_has_error "$settings"
+    if [[ $? -eq 0 ]]; then
+        declare -A attributes
+        attributes[ip_family]="IP Family"
+        attributes[ip]="IPv4 address"
+        attributes[subnet]="IPv4 subnet mask"
+        attributes[gateway]="IPv4 gateway address"
+        attributes[dns_primary]="IPv4 primary DNS"
+        attributes[dns_secondary]="IPv4 secondary DNS"
+        attributes[mtu]="MTU"
+        attributes[domains]="Domains"
+
+        local single_json_obj=""
+        for attribute in "${!attributes[@]}"; do
+            local item="$(parse_qmicli_result "$settings" "${attributes[$attribute]}")"
+            single_json_obj+="$(create_json_structure \
+                "$(add_json_string_attribute "$attribute" "$item")")"
+        done
+        result="$(create_result "success")"
+        local value="$(combine_json_attributes_from_objs $single_json_obj)"
+    else
+        result="$(create_result "error" "$settings")"
+    fi
+    create_json_return "$result" "$value"
+}
+
+# Get the operating mode of the modem
+# Return: JSON object with the following keys:
+#   - operating_mode: operating mode of the modem
+# Possible values:
+#   - offline/online-connected/online-disconnected/radio-off/unrecognized
+function get_operating_mode() {
+    local dms_mode=$(_get_dms_operating_mode)
+    local wds_mode=$(_get_wds_operating_mode)
+    local operating_mode=""
+    case $dms_mode in
+    "offline")
+        operating_mode="offline"
+        ;;
+    "online")
+        if [[ $wds_mode == "connected" ]]; then
+            operating_mode="online-connected"
+        else
+            operating_mode="online-disconnected"
+        fi
+        ;;
+    "low-power" | "persistent-low-power" | "mode-only-low-power")
+        operating_mode="radio-off"
+        ;;
+    *)
+        operating_mode="unrecognized"
+        ;;
+    esac
+    if [[ -n $operating_mode ]]; then
+        local result="$(create_result "success")"
+    else
+        local result="$(create_result "error" "operating mode not found")"
+    fi
+    local value="$(create_json_structure \
+        "$(add_json_string_attribute "operating_mode" "$operating_mode")")"
+    create_json_return "$result" "$value"
+}
+
+function check_autoreconnect() {
+
+    local assigned_itf_ip=""
+    _check_itf_assigned_inet
+    if [[ $? -eq 0 ]]; then
+        assigned_itf_ip="$(_get_assigned_itf_inet)"
+    else 
+        log_msg "warning" "Autoreconnect check is called - IP not assigned"
+    fi
+
+    local report_action="assigned_ip_eq_provided"
+
+    local provider_network_settings="$(get_network_settings)"
+    local provider_network_settings_state="$(parse_json_attribute "$provider_network_settings" "state")"
+    provider_network_settings_state="$(parse_json_attribute "$provider_network_settings_state" "state")"
+
+    if [[ "$provider_network_settings_state" == "success" ]]; then
+        local result="$(create_result "success")"
+
+        local provider_network_settings_value="$(parse_json_attribute "$provider_network_settings" "value")"
+        local provider_network_settings_value_ip="$(parse_json_attribute "$provider_network_settings_value" "ip")"
+        if [[ "$provider_network_settings_value_ip" != "$assigned_itf_ip" ]]; then
+            log_msg "info" "Assigned IP $assigned_itf_ip is different or not set as the provided $provider_network_settings_value_ip"
+            _set_itf_state "down"
+            _set_raw_mode
+            _set_itf_state "up"
+            report_action="update_network_settings_needed"
+        fi        
+    else
+        local result="$(create_result "error" "no provider network settings available")"
+    fi
+    local value="$(create_json_structure \
+        "$(add_json_string_attribute "report_action" "$report_action")")"
+    
+    create_json_return "$result" "$value"
+}
+
+# Get the signal strength of the modem for current cell
+# Return: JSON objects
+# simple_signal: JSON object with the following keys:
+#   - signal_human_readable: signal strength in human readable format
+#   - signal_bar: signal strength in bars
+# extended_signal: JSON object with the following keys:
+#   - rssi JSON object with the following keys:
+#       - value: RSSI in dBm
+#       - unit: unit of RSSI
+#   - rsrq JSON object with the following keys:
+#       - value: RSRQ in dB
+#       - unit: unit of RSRQ
+#   - rsrp JSON object with the following keys:
+#       - value: RSRP in dBm
+#       - unit: unit of RSRP
+#   - snr JSON object with the following keys:
+#       - value: SNR in dB
+#       - unit: unit of SNR
+function get_signal_strength() {
+    local signal_info_result="$(_get_signal_info)"
+    local rssi_obj="$(parse_json_attribute "$signal_info_result" "rssi")"
+    local rssi_value="$(parse_json_attribute "$rssi_obj" "value")"
+    local number=$(is_number $rssi_value)
+
+    if [[ -n $number ]]; then
+        local dbm=$number
+        if [[ $dbm -gt -73 ]]; then
+            signal_human_readable="excellent"
+            signal_bar=4
+        elif [[ $dbm -gt -83 ]]; then
+            signal_human_readable="good"
+            signal_bar=3
+        elif [[ $dbm -gt -93 ]]; then
+            signal_human_readable="fair"
+            signal_bar=2
+        elif [[ $dbm -gt -109 ]]; then
+            signal_human_readable="marginal"
+            signal_bar=1
+        else
+            signal_human_readable="very Poor"
+            signal_bar=0
+        fi
+        local result="$(create_result "success")"
+        local simple_signal="$(create_json_structure \
+            "$(add_json_string_attribute "signal_human_readable" "$signal_human_readable")" \
+            "$(add_json_attribute "signal_bar" "$signal_bar")")"
+
+        local extended_signal="$(_get_signal_info)"
+
+        local value="$(create_json_structure \
+            "$(add_json_object "simple_signal" "$simple_signal")" \
+            "$(add_json_object "extended_signal" "$extended_signal")")"
+
+    else
+        log_msg "error" "Invalid signal strength"
+
+        # Check if there is a error message available
+        local check_error="$(parse_json_attribute "$signal_info_result" "error")"
+        if [[ -n "$check_error" ]]; then
+            log_msg "error" "Signal fetch error message '$check_error"
+        fi 
+        
+        local result="$(create_result "error" "invalid signal strength")"
+    fi
+
+    create_json_return "$result" "$value"
+}
+
+function get_packet_statistics() {
+    # Call this function to check if the modem is initialized
+    # If it is not initialized we abort the function
+    #_check_initialized
+    local statistics="$(exec_qmi_cmd 10 1 --wds-get-packet-statistics)"
+    cmd_has_error "$statistics"
+    if [[ $? -eq 0 ]]; then
+        local result="$(create_result "success")"
+        local tx_packets="$(parse_qmicli_result "$statistics" "TX packets OK")"
+        local tx_bytes="$(parse_qmicli_result "$statistics" "TX bytes OK")"
+        local tx_dropped_packets="$(parse_qmicli_result "$statistics" "TX packets dropped")"
+        local rx_packets="$(parse_qmicli_result "$statistics" "RX packets OK")"
+        local rx_bytes="$(parse_qmicli_result "$statistics" "RX bytes OK")"
+        local rx_dropped_packets="$(parse_qmicli_result "$statistics" "RX packets dropped")"
+
+        local value="$(create_json_structure \
+            "$(add_json_attribute "tx_packets" "${tx_packets:-0}")" \
+            "$(add_json_attribute "tx_bytes" "${tx_bytes:-0}")" \
+            "$(add_json_attribute "tx_dropped_packets" "${tx_dropped_packets:-0}")" \
+            "$(add_json_attribute "rx_packets" "${rx_packets:-0}")" \
+            "$(add_json_attribute "rx_bytes" "${rx_bytes:-0}")" \
+            "$(add_json_attribute "rx_dropped_packets" "${rx_dropped_packets:-0}")")"
+    else
+        local result="$(create_result "error" "$statistics")"
+    fi
+
+    create_json_return "$result" "$value"
+}
+
+# Get the current serving provider
+# Return: JSON object with the following keys:
+#   - plmn: PLMN of the serving provider
+#   - description: Description of the serving provider
+#   - roaming: Roaming status of the serving provider
+#   - mcc: MCC of the serving provider
+#   - mnc: MNC of the serving provider
+function get_serving_provider() {
+    local info="$(exec_qmi_cmd 60 0 --nas-get-serving-system)"
+    local registration_state="$(parse_qmicli_result "$info" "Registration state")"
+    if [ "$registration_state" != "registered" ]; then
+        exit 1
+    fi
+    local mcc="$(parse_qmicli_result "$info" "MCC")"
+    local mnc="$(parse_qmicli_result "$info" "MNC")"
+    local description="$(parse_qmicli_result "$info" "Description")"
+    local roaming="$(parse_qmicli_result "$info" "Roaming status")"
+    local selected_network="$(parse_qmicli_result "$info" "Selected network")"
+    local plmn="$(printf "%03d-%02d" "$mcc" "$mnc" 2>/dev/null)"
+    if [ "$roaming" = "on" ]; then
+        roaming="true"
+    else
+        roaming="false"
+    fi
+
+    local is_current_serving_provider="true"
+
+    local result="$(create_result "success")"
+    local value="$(create_json_structure \
+        "$(add_json_string_attribute "plmn" "$plmn")" \
+        "$(add_json_attribute "mcc" "$mcc")" \
+        "$(add_json_attribute "mnc" "$mnc")" \
+        "$(add_json_string_attribute "description" "$description")" \
+        "$(add_json_attribute "roaming" "$roaming")" \
+        "$(add_json_string_attribute "selected_network" "$selected_network")" \
+        "$(add_json_attribute "current_serving" "$is_current_serving_provider")")"
+
+    create_json_return "$result" "$value"
+}
+
+# Initialize a modem with the given settings
+# This will setup the connection and wait for the modem to be ready
+# Afterwards the modem will connect to the network
+# Params:
+#   - $1: apn
+#   - $2: auth (NONE|PAP|CHAP|BOTH)
+#   - $3: no_roaming (yes|no)
+#   - $4: username
+#   - $5: password
+# Return: JSON object with the following keys:
+#  - sim_info: JSON Object with sim info
+#  - profile_settings: JSON Object with profile info
+#  - interface: JSON Object with interface info
+#  - network_settings: JSON Object with network info
+#  - device_info: JSON Object with device info
+#  - serving_provider: JSON Object with serving provider
+#  - signal_strength: JSON Object with signal strength info
+#  - operating_mode: JSON Object with operating mode info
+function init_modem() {
+    local apn="$1"
+    local auth="$2"
+    local no_roaming="$3"
+    local username="$4"
+    local password="$5"
+
+    # lock the process to avoid multiple init processes
+    lock_process "${STATE_DIR}/init_modem.lock"
+    if ! _is_modem_initialized; then
+        log_msg "info" "Initializing modem"
+    else
+        _abort_handle "warning" "Modem already initialized" "skip"
+        exit 1
+    fi
+
+    # Step - Wait for the SIM slot, app state and PIN info to be ready
+    local sim_info_json=$(get_sim_info)
+    local sim_state=$(parse_json_attribute "$sim_info_json" "state")
+    sim_state=$(parse_json_attribute "$sim_state" "state")
+    if [[ $sim_state == "ready" ]]; then
+        # We expect the sim_state to be 'ready' to go ahead
+        log_msg "info" "SIM card ready"
+    else
+        _abort_handle "error" "SIM card error: $sim_state"
+        exit 1
+    fi
+
+    # Step - Wait for registration
+    local pdp_type="IPV4"
+
+    profile_number="$(_get_default_profile_number)"
+    _update_profile \
+        "profile_number=$profile_number" \
+        "apn=$apn" \
+        "pdp_type=IPV4" \
+        "username=$username" \
+        "password=$password" \
+        "auth=$auth" \
+        "no-roaming=$no_roaming"
+
+    local profile_settings="$(_get_profile_settings)"
+
+    local counter=0
+    while [[ "$(_get_registration_state 2>/dev/null)" != "registered" ]]; do
+        if ((counter > MAX_WAIT_TIME)); then
+            _abort_handle "error" "Registration timeout"
+            exit 1
+        fi
+        log_msg "info" "Waiting for registration"
+        sleep 1
+        ((counter++))
+    done
+
+    # Step - Get the operating mode and set it to online if it is not online
+    local operating_mode=$(_get_dms_operating_mode)
+    if [[ $operating_mode != "online" ]]; then
+        # If we are not online, try to reset!
+        log_msg "info" "Set operating mode to online"
+        _set_operating_mode "offline" 5 &>/dev/null
+        _set_operating_mode "reset" 5 &>/dev/null
+    fi
+    local counter=0
+    while [[ "$(_get_dms_operating_mode 2>/dev/null)" != "online" ]]; do
+        if ((counter > MAX_WAIT_TIME)); then
+            _abort_handle "error" "DMS mode timeout"
+            exit 1
+        fi
+        log_msg "info" "Waiting for DMS to be online"
+        sleep 1
+        ((counter++))
+    done
+
+
+    # Step - Try to connect to the network
+    local result_network="$(_start_network "$profile_number")"
+    local result_network_state="$(parse_json_attribute "$result_network" "state")"
+    result_network_state="$(parse_json_attribute "$result_network_state" "state")"
+    if [[ "$result_network_state" == "success" ]]; then
+        local result_network_ids="$(parse_json_attribute "$result_network" "value")"
+    else
+        # check if autoreconnect did already connect!
+        local op_mode="$(get_operating_mode)"
+        local op_mode_value="$(parse_json_attribute "$op_mode" "value")"
+        op_mode_value="$(parse_json_attribute "$op_mode_value" "operating_mode")"
+        if [[ "$op_mode_value" == "online-connected" ]]; then
+            log_msg "info" "Already auto reconnected!"
+        else
+            _abort_handle "error" "Error starting network: $result_network_state"
+            exit 1
+        fi 
+    fi
+
+
+    local counter=0
+    while [[ "$(_get_wds_operating_mode 2>/dev/null)" != "connected" ]]; do
+        if ((counter > MAX_WAIT_TIME)); then
+            _abort_handle "error" "Wating network timeout"
+            exit 1
+        fi
+        log_msg "info" "Waiting for Network to be connected"
+        sleep 1
+        ((counter++))
+    done
+
+    # Step - Wait for network settings
+    local counter=0
+    while true; do
+        local network_settings="$(get_network_settings)"
+        local network_settings_state=$(parse_json_attribute "$network_settings" "state")
+        network_settings_state=$(parse_json_attribute "$network_settings_state" "state")
+
+        if [[ "$network_settings_state" == "success" ]]; then
+            break
+        fi
+        if ((counter > MAX_WAIT_TIME)); then
+            _abort_handle "error" "Wating for network settings timeout"
+            exit 1
+        fi
+
+        log_msg "info" "Waiting for network settings"
+        sleep 1
+        ((counter++))
+    done
+
+    # Step - Set autoconnection mode
+    local autoconnect_state="enabled" # TODO: Check from where we fetch this info
+    local autoconnect_type="home-only"
+    if [[ "$no_roaming" == "yes" ]]; then
+        autoconnect_type="home-only";
+    else
+        autoconnect_type="roaming-allowed";
+    fi
+
+    _set_autoconnect "$autoconnect_state" "$autoconnect_type"
+
+    if [[ $? -eq 0 ]]; then
+        log_msg "info" "set autoconnect to $autoconnect_state $autoconnect_type"
+    else
+        log_msg "error" "failed to set autoconnect with parameters $autoconnect_state $autoconnect_type"
+    fi
+
+    local sim_value=$(parse_json_attribute "$(get_sim_info)" "value")
+    local profile_settings_value=$(parse_json_attribute "$profile_settings" "value")
+    local interface_value=$(parse_json_attribute "$(get_itf_information)" "value")
+    local network_settings_value=$(parse_json_attribute "$(get_network_settings)" "value")
+    local device_info_value=$(parse_json_attribute "$(get_device_info)" "value")
+    local serving_provider_value=$(parse_json_attribute "$(get_serving_provider)" "value")
+    local signal_strength_value=$(parse_json_attribute "$(get_signal_strength)" "value")
+    local operating_mode_value=$(parse_json_attribute "$(get_operating_mode)" "value")
+
+    local result="$(create_result "success")"
+    local value="$(create_json_structure \
+        "$(add_json_object "sim_info" "$sim_value")" \
+        "$(add_json_object "profile_settings" "$profile_settings_value")" \
+        "$(add_json_object "interface" "$interface_value")" \
+        "$(add_json_object "network_settings" "$network_settings_value")" \
+        "$(add_json_object "device_info" "$device_info_value")" \
+        "$(add_json_object "serving_provider" "$serving_provider_value")" \
+        "$(add_json_object "signal_strength" "$signal_strength_value")" \
+        "$(add_json_object "operating_mode" "$operating_mode_value")")"
+
+    create_json_return "$result" "$value"
+
+    _set_initialization_state true
+    unlock_process
+}
+
+# Teardown the modem connection and reset the modem to be used again
+# 
+# Return:
+#   - operating_mode: JSON object with the last operating mode after disconnecting
+function teardown_modem() {
+    lock_process "${STATE_DIR}/teardown_modem.lock"
+    log_msg "info" "Teardown modem"
+
+    local autoconnect_state="disabled"
+    local autoconnect_type="home-only"
+    _set_autoconnect "$autoconnect_state" "$autoconnect_type"
+    if [[ $? -eq 0 ]]; then
+        log_msg "info" "set autoconnect to $autoconnect_state $autoconnect_type"
+    else
+        log_msg "error" "failed to set autconnect with parameters $autoconnect_state $autoconnect_type"
+    fi
+
+    local disconnect="$(_stop_network)"
+    
+    log_msg "info" "Set interface down"
+    local is_itf_down=false
+    _set_itf_state "down"
+
+    log_msg "info" "Get modem Info"
+
+    usb_modem_id=$(_find_modem_by_vendor_id $VENDOR_ID_MODEM)
+    modem_was_found_before_reset=false
+    if [ $? -eq 0 ]; then
+        log_msg "info" "Modem found with vendor/product ID: $usb_modem_id"
+        modem_was_found_before_reset=true
+    else
+        log_msg "warning" "Modem not found before reset - vendor ID: $VENDOR_ID_MODEM"
+        modem_was_found_before_reset=false
+    fi
+
+    log_msg "info" "Reset modem"
+    _reset_modem
+
+    if [[ $modem_was_found_before_reset == true ]]; then
+        while true; do
+            if lsusb | grep -q "$usb_modem_id"; then
+                break
+            else
+                log_msg "info" "Wait until modem with vendor/product ID: $usb_modem_id is detected again"
+                sleep 1
+            fi
+        done
+    fi
+    
+    while [[ ! $(_get_dms_operating_mode 2>/dev/null) =~ ^(online|low_power|offline|reset)$ ]]; do
+        sleep 1
+        log_msg "info" "Waiting for modem to be detected again"
+    done
+
+    log_msg "info" "Modem detected again with operating mode: $(_get_dms_operating_mode)"
+    log_msg "info" "Remove initialization state file"
+    _cleanup_network_ids
+    _set_initialization_state false
+    echo_json "$disconnect"
+    unlock_process
+}
+
+# Check if the modem is physically available
+#
+# Return: JSON object with the following keys:
+#   - usb_vendor_product: vendor/product ID of the modem
+#   - device_path: path to the control device
+function is_modem_available() {
+    local is_available=false
+    local modem=$(_find_modem_by_vendor_id $VENDOR_ID_MODEM)
+    if [ $? -eq 0 ]; then
+        log_msg "info" "Modem found with vendor/product ID: $modem"
+        if [ -e $DEVICE_PATH ]; then
+            log_msg "info" "Control device found at $DEVICE_PATH"
+            is_available=true
+        fi
+    else
+        log_msg "error" "Modem not found with vendor ID: $VENDOR_ID_MODEM"
+    fi
+    if [[ $is_available == true ]]; then
+        local result="$(create_result "success")"
+        local value="$(create_json_structure \
+            "$(add_json_string_attribute "usb_vendor_product" "$modem")" \
+            "$(add_json_string_attribute "device_path" "$DEVICE_PATH")")"
+    else
+        local result="$(create_result "error" "modem not found")"
+    fi
+
+    create_json_return "$result" "$value"
+}
+
+### END PUBLIC FUNCTIONS ###
+
+### BEGIN SECTION CONFIG.JSON HANDLING ###
+
+# Check if a given "cellular" object contains the given setting
+# Params:
+#   - $1: cellular object
+#   - $2: setting (apn|auth|no_roaming|username|password)
+# Return: value of the setting
+function _get_setting() {
+    local cellular_obj="$1"
+    local setting="$2"
+    local settings_obj="$(parse_json_attribute "$cellular_obj" "settings")"
+    local value="$(parse_json_attribute "$settings_obj" "$setting")"
+    echo "$value"
+}
+
+# Check if a given json file contains the object "cellular" in "network" and return it
+# Params:
+#   - $1: path to the json file
+# Return: JSON object with the following keys:
+#   - cellular object
+function _get_cellular_obj() {
+    local config_json="$(cat "$1")"
+    local network_obj="$(parse_json_attribute "$config_json" "network")"
+    local cellular_obj="$(parse_json_attribute "$network_obj" "cellular")"
+
+    if [[ -n $cellular_obj ]]; then
+        echo_json $cellular_obj
+    fi
+}
+
+### END SECTION CONFIG.JSON HANDLING ###
+
+
+while (($#)); do
+    case $1 in
+    -is-modem-available)
+        is_modem_available
+        ;;
+    -init-modem)
+        shift
+        mode=""
+        apn=""
+        no_roaming=""
+        auth=""
+        username=""
+        password=""
+        while (($#)); do
+            case $1 in
+            --mode=*)
+                mode="${1#*=}"
+                shift
+                ;;
+            --apn=*)
+                apn="${1#*=}"
+                shift
+                ;;
+            --no-roaming=*)
+                no_roaming="${1#*=}"
+                shift
+                ;;
+            --auth=*)
+                auth="${1#*=}"
+                shift
+                ;;
+            --username=*)
+                username="${1#*=}"
+                shift
+                ;;
+            --password=*)
+                password="${1#*=}"
+                shift
+                ;;
+            *)
+                break
+                ;;
+            esac
+        done
+        if [[ -z $mode ]]; then
+            _invalid_input_msg "error" "Missing required parameters for -init-modem --mode=<standalone|/path/to/config.json>"
+            exit 1
+        fi
+        if [[ $mode != "standalone" && ! -f $mode ]]; then
+            _invalid_input_msg "error" "Mode should be 'standalone' or a valid file path."
+            exit 1
+        fi
+        if [[ $mode == "standalone" && -z $apn ]]; then
+            _invalid_input_msg "error" "Missing required parameters for -init-modem --apn=<apn>"
+            exit 1
+        fi
+
+        if [[ -f $mode ]]; then
+            cellular_data="$(_get_cellular_obj "$mode")"
+            if [[ -n $cellular_data ]]; then
+                apn="$(_get_setting "$cellular_data" "apn")"
+                auth="$(_get_setting "$cellular_data" "auth")"
+                no_roaming="$(_get_setting "$cellular_data" "no_roaming")"
+                username="$(_get_setting "$cellular_data" "username")"
+                password="$(_get_setting "$cellular_data" "password")"
+            else
+                _invalid_input_msg "error" "Invalid JSON file: $mode"
+                exit 1
+            fi
+        fi
+
+        if [[ -z $no_roaming ]]; then
+            no_roaming="no"
+        elif [[ $no_roaming != "yes" && $no_roaming != "no" ]]; then
+            _invalid_input_msg "error" "Invalid parameter value for --no-roaming=<yes|no> should be 'yes' or 'no'"
+            exit 1
+        fi
+
+        check_auth="$(_input_check_auth "$auth")"
+        if [[ -z $check_auth ]]; then
+            _invalid_input_msg "error" "Invalid parameter value for --auth=<NONE|PAP|CHAP|BOTH> should be 'NONE', 'PAP', 'CHAP' or 'BOTH'"
+            exit 1
+        else
+            auth="$check_auth"
+        fi
+
+        log_msg "info" "Try to init modem with parameters: mode=$mode, apn=$apn, no_roaming=$no_roaming, auth=$auth, username=$username, password=$password"
+
+        init_modem "$apn" "$auth" "$no_roaming" "$username" "$password"
+        ;;
+    -get-operating-mode)
+        get_operating_mode
+        ;;
+
+    -check-autoreconnect)
+        check_autoreconnect
+        ;;
+    -get-device-info)
+        get_device_info
+        ;;
+    -get-signal-strength)
+        get_signal_strength
+        ;;
+    -get-packet-statistics)
+        get_packet_statistics
+        ;;
+    -get-sim-info)
+        get_sim_info
+        ;;
+    -get-serving-provider)
+        get_serving_provider
+        ;;
+    -get-itf-information)
+        get_itf_information
+        ;;
+    -get-network-settings)
+        get_network_settings
+        ;;
+    -teardown-modem)
+        teardown_modem
+        ;;
+    *) ;;
+    esac
+    shift
+done

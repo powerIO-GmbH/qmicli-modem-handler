@@ -1,0 +1,311 @@
+#!/bin/bash
+
+# Log msg by type (info, error, warning, debug)
+# params:
+#  - $1: type of message (info, error, warning, debug)
+#  - $2: message
+function log_msg() {
+    local type_msg="$1"
+    local message="$2"
+    if [[ -z "$type_msg" ]]; then
+        type_msg="info"
+    fi
+
+    if [[ -z "$message" ]]; then
+        # If the message is empty, set the type_msg as the message
+        # And set the logging type to "info"
+        message="$type_msg"
+        type_msg="info"
+    fi
+    if [[ $DEBUG -eq 1 ]]; then
+        if [[ $DEBUG_LOG_AS_JSON -eq 1 ]]; then
+            parse_output --json "log_type" "$type_msg" "log_msg" "$(date) [$type_msg]: $message"
+        else
+            echo "$(date) [$type_msg]: $message" >&2
+        fi
+    fi
+    echo "$(date) [$type_msg]: $message" >>"$LOG_FILE"
+}
+
+# Parse the output of a command to json
+# $1: flag to indicate if the output should be parsed as json
+# $2: key of the first value
+# $3: value of the first key
+# and so on...
+function parse_output() {
+    declare -A kv_pairs
+    json_flag="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        key="$1"
+        shift
+        value="$1"
+        shift
+        kv_pairs["$key"]="$value"
+    done
+
+    if [[ $json_flag == "--json" ]]; then
+        json="{"
+        for key in "${!kv_pairs[@]}"; do
+            json+="\"$key\":\"${kv_pairs[$key]}\","
+        done
+        # Remove trailing comma and close the JSON object
+        json="${json%,}}"
+        echo "$json"
+    else
+        for key in "${!kv_pairs[@]}"; do
+            echo "Key: $key, Value: ${kv_pairs[$key]}"
+        done
+    fi
+}
+
+
+# Add a json attribute like boolean or number
+# Params:
+#   - $1: key of the attribute
+#   - $2: value of the attribute
+# Return: json attribute
+function add_json_attribute() {
+    printf '"%s":%s' "$1" "$2"
+}
+
+# Add a json string attribute
+# Params:
+#   - $1: key of the attribute
+#   - $2: value of the attribute
+# Return: json string attribute
+function add_json_string_attribute() {
+    printf '"%s":"%s"' "$1" "$2"
+}
+
+# Add a json object to an existing json structure
+# Params:
+#   - $1: key of the object
+#   - $2: value of the object
+function add_json_object() {
+  
+  printf '"%s":%s' "$1" "$2"
+}
+
+# Create a json array from a list of arguments
+# Params:
+#   - $@: list of arguments to create the json array
+# Return: json array
+function create_json_array() {
+  local parse_items="$(while read -r line; do [ -n "${line}" ] && printf ",%s" "${line}"; done | cut -c2-)"
+  
+  printf "[%s]" "$parse_items"
+}
+
+# Create a json structure from a list of arguments
+# Params:
+#   - $@: list of arguments to create the json structure
+# Return: json structure
+function create_json_structure() {
+    local parse_items="$(for argument in "${@}"; do printf ",%s" "$argument"; done | cut -c2-)"
+    
+    printf "{%s}" "$parse_items"
+}
+
+# Parse a json attribute
+# Params:
+#   - $1: json
+#   - $2: path of the attribute
+# Return: value of the attribute
+function parse_json_attribute() {
+  local json="$1"
+  local path="$2"
+
+  printf "$json" | jq -rc ".$path | select (.!=null)"
+}
+
+function combine_json_attributes_from_objs() {
+  echo ${@} | jq -s -c 'add'
+}
+
+# Create a json result with the state and message
+# Params:
+#   - $1: state
+#   - $2: message
+# Return: json result
+function create_result() {
+    local state="$1"
+    local message="$2"
+    
+    if [[ -z "$message" ]]; then
+        message="$state"
+    fi
+ 
+    local json="$(create_json_structure \
+        "$(add_json_string_attribute "state" "$state")" \
+        "$(add_json_string_attribute "message" "$message")")"
+    echo "$json"
+}
+
+# Create a json return with the state and value
+# Params:
+#   - $1: state object
+#   - $2: value object
+# Return: json return as jq -c output
+function create_json_return(){
+    local state_result="$1"
+    local value_result="$2"
+
+    if [[ -z "$value_result" ]]; then
+        value_result="{}"
+    fi
+
+    local json="$(create_json_structure \
+        "$(add_json_object "state" "$state_result")" \
+        "$(add_json_object "value" "$value_result")")"
+    echo "$json" | jq
+}
+
+function echo_json(){
+    local json="$1"
+    echo "$json" | jq
+}
+
+# Parse the output of qmicli to get the value of an attribute
+# Params:
+#   - $1: output of qmicli
+#   - $2: attribute to get the value
+#   - $3: unit of the value
+# Return: value of the attribute
+function parse_qmicli_result() {
+  local stdout="$1"
+  local attr="$2"
+  local unit="$3"
+  local val="$(echo "$stdout" | sed -n "s/\s*$attr: \(.*\)$unit/\1/p" | head -n 1 | tr -d "'")"
+  if [ "$val" = "unknown" ]; then
+    val=""
+  fi
+  echo "$val"
+}
+
+# Lock a process by creating a lock file
+# This is used to avoid multiple executions of the same process if this script is called multiple times
+function lock_process() {
+    local lock_file="$1"
+    exec 200> "${lock_file}"
+    if ! flock -n 200 ; then
+        log_msg "warning" "Another instance of ${lock_file%.*} is running"
+        local result="$(create_result "error" "another_instance_running")"
+        create_json_return "$result"
+        if ! flock 200 ; then
+            return 1
+        fi
+    fi
+}
+
+# Unlock a process by releasing the lock file
+function unlock_process() {
+    flock -u 200
+}
+
+
+# QMI error handler
+function qmi_error_handler() {
+    local status=$1
+    local ignore=$2
+
+    local statedir=$STATE_DIR
+    local error_limit=25
+
+    [ -d "$statedir" ] || {
+        log_msg "error" "$statedir does not exist"
+        return 254
+    }
+
+    local errorcounter
+    local qmi_errors
+    local qmi_errors_file="$statedir/qmi_errors"
+    if [ ! -f "$qmi_errors_file" ]; then
+        echo "0" >$qmi_errors_file
+    fi
+    let errorcounter=0
+    read qmi_errors <$qmi_errors_file 2>/dev/null || qmi_errors=0
+    let errorcounter+=$qmi_errors
+
+    if [ -z "$ignore" ]; then
+        if [ $status -gt 0 ]; then
+            let errorcounter+=1
+        else
+            let errorcounter=0
+        fi
+    fi
+    echo "$errorcounter" >$qmi_errors_file
+    if [ -z "$ignore" ] && [ "$errorcounter" -gt 0 ] && [ "$status" -gt 0 ]; then
+        log_msg "error" "ErrorCounter of $device raised to $errorcounter"
+    fi
+    if [ "$errorcounter" -gt "$error_limit" ]; then
+        log_msg "error" "Error limit $error_limit reached with error counter $errocounter, take action."
+    fi
+    return $status
+}
+
+# Execute a qmicli command and lock the execution to avoid multiple executions at the same time.
+# Handle timeout and errors and log them if needed.
+# params:
+#   - $1: timeout
+#   - $2: ignore error
+#   - $3: qmicli command to execute
+# return: result of the command
+function exec_qmi_cmd() {
+    local timeout="$1"
+    local show_error="$2"
+
+    local start status lockfile duration statedir
+    duration=0
+    statedir=$STATE_DIR
+    lockfile=$LOCK_FILE
+    # Check if the cdc device exists
+    if [ ! -e $DEVICE_PATH ]; then
+        log_msg "error" "Device not found at $DEVICE_PATH"
+        exit 1
+    fi
+    shift
+    shift
+    start=$(date +%s)
+    #flock $lockfile timeout -s KILL "$timeout" qmicli "-d" "$DEVICE_PATH" "$@"
+    if [[ $show_error -eq 1 ]]; then
+        output=$(flock $lockfile timeout -s KILL "$timeout" qmicli "-p" "-d" "$DEVICE_PATH" "$@" 2>&1)
+    else
+        output=$(flock $lockfile timeout -s KILL "$timeout" qmicli "-p" "-d" "$DEVICE_PATH" "$@" 2>/dev/null)
+    fi
+    status=$?
+    let duration=$(date +%s)-start
+    if [ $duration -ge $timeout ]; then
+        if [ "$status" -gt 0 ]; then
+            log_msg "error" "Timeout occurred running command qmicli $@"
+        fi
+        #qmi_error_handler 128 "$show_error"
+    else
+        if [ "$status" -gt 0 ]; then
+            log_msg "error" "Error $status occurred running command qmicli command: $@"
+        fi
+        #qmi_error_handler "$status" "$show_error"
+    fi
+    echo "$output"
+    return $?
+}
+
+# Simple error check of the return value of a command
+function cmd_has_error() {
+  local cmd_result="$1"
+  if [[ $cmd_result == *"error:"* ]]; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+# Check if result is a number
+# Params:
+#   - $1 number to check
+# Return: 0 if it is a number, 1 otherwise
+function is_number() {
+    local re='^([-+]?[0-9]+\.?[0-9]*|[-+]?[0-9]*\.?[0-9]+)$'
+    [[ $1 =~ $re ]] && echo "$1"
+}
