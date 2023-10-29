@@ -817,8 +817,9 @@ function get_device_info() {
     create_json_return "$result" "$value"
 }
 
-# Get all information about the interface
-#
+# Retrieves network interface information related to the modem.
+# 
+# Parameters: None
 # Return: JSON object with the following keys:
 #   - used_interface: interface name
 #   - interface_available: true/false
