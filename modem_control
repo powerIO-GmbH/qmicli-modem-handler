@@ -1,31 +1,50 @@
 #!/bin/bash
 # shellcheck disable=SC2155
 
-declare DEBUG=0                               # 1 to enable debug, 0 to disable
-declare DEBUG_LOG_AS_JSON=0                   # 1 to log as json, 0 to log as text
-declare LOG_FILE="/var/log/modem_control.log" # log file
-
+### modem related constants
 readonly DEVICE_PATH="/dev/cdc-wdm0" # cdc device to control modem
 readonly VENDOR_ID_MODEM="1508"      # vendor id of the modem
-readonly DELAY_TIME_ITF_CHANGE=2     # seconds of delay after interface change up/down
-declare STATE_DIR="/tmp/modem_control"
-declare LOCK_FILE="${STATE_DIR}/active_execution.lock" # used for every qmicli call
 
-readonly MAX_WAIT_TIME=40
-readonly MODEM_HELPER_SOURCE="/usr/powerio/sbin/modem_helper"
+### path related constants
+declare LOG_FILE="/var/log/modem_control.log"                 # log file path
+readonly STATE_DIR="/tmp/modem_control"                       # state dir for network ids
+declare LOCK_FILE="${STATE_DIR}/active_execution.lock"        # lock file to avoid multiple initialization executions
+script_dir=$(dirname "${BASH_SOURCE[0]}")
+readonly MODEM_HELPER_SOURCE="$script_dir/modem_helper"
 
+### debug related constants
+declare DEBUG=0             # 1 to enable debug, 0 to disable
+declare DEBUG_LOG_AS_JSON=0 # 1 to log as json, 0 to log as text
+
+### time related constants
+readonly DELAY_TIME_ITF_CHANGE=2 # seconds of delay after interface change up/down
+readonly MAX_WAIT_TIME=40        # seconds to wait for some loop operations
 
 # load helper functions script
 if [[ ! -f "$MODEM_HELPER_SOURCE" ]]; then
-    echo "modem_helper not found"
+    log_msg "error" "Modem helper not found ${missing_utilities[*]}" >&2
     exit 1
 else
     source "$MODEM_HELPER_SOURCE"
 fi
 
-# Check if the required commands are installed
-if [[ ! $(command -v jq) ]]; then
-    log_msg "error" "jq is not installed"
+# Function to check if required utilities are available
+function check_required_utilities() {
+    local required_utilities=("usbreset" "qmicli" "awk" "jq")
+    local missing_utilities=()
+
+    for cmd in "${required_utilities[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_utilities+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_utilities[@]} -ne 0 ]]; then
+        log_msg "error" "The following utilities are not installed: ${missing_utilities[*]}" >&2
+        return 1
+    fi
+}
+if ! check_required_utilities; then
     exit 1
 fi
 
@@ -34,12 +53,11 @@ if [[ ! -d $STATE_DIR ]]; then
     mkdir -p $STATE_DIR
 fi
 
-
 ### SECTION INTERFACE CONTROL ###
 
 # Get the interface by which the modem is connected
 # The information is obtained from the modem cdc itself
-# 
+#
 # Return: JSON object with the following keys:
 #   - used_interface: interface name
 function _get_itf() {
@@ -170,7 +188,7 @@ function _save_network_ids() {
 }
 
 # Get network ids from a file
-# 
+#
 # Return:
 #    -  a simple json object with "<key>":"<value>" pairs
 function _get_network_ids() {
@@ -373,7 +391,7 @@ function _get_card_state() {
 }
 
 # Check the Slot and application state
-# 
+#
 # param: info - qmicli output
 # Return: array
 # key 'state': (available|not-available)
@@ -662,7 +680,7 @@ function _set_autoconnect() {
         return 0
     else
         return 1
-    fi 
+    fi
 }
 
 # Start the network with the given profile id.
@@ -818,7 +836,7 @@ function get_device_info() {
 }
 
 # Retrieves network interface information related to the modem.
-# 
+#
 # Parameters: None
 # Return: JSON object with the following keys:
 #   - used_interface: interface name
@@ -1001,7 +1019,7 @@ function check_autoreconnect() {
     _check_itf_assigned_inet
     if [[ $? -eq 0 ]]; then
         assigned_itf_ip="$(_get_assigned_itf_inet)"
-    else 
+    else
         log_msg "warning" "Autoreconnect check is called - IP not assigned"
     fi
 
@@ -1022,13 +1040,13 @@ function check_autoreconnect() {
             _set_raw_mode
             _set_itf_state "up"
             report_action="update_network_settings_needed"
-        fi        
+        fi
     else
         local result="$(create_result "error" "no provider network settings available")"
     fi
     local value="$(create_json_structure \
         "$(add_json_string_attribute "report_action" "$report_action")")"
-    
+
     create_json_return "$result" "$value"
 }
 
@@ -1092,8 +1110,8 @@ function get_signal_strength() {
         local check_error="$(parse_json_attribute "$signal_info_result" "error")"
         if [[ -n "$check_error" ]]; then
             log_msg "error" "Signal fetch error message '$check_error"
-        fi 
-        
+        fi
+
         local result="$(create_result "error" "invalid signal strength")"
     fi
 
@@ -1260,7 +1278,6 @@ function init_modem() {
         ((counter++))
     done
 
-
     # Step - Try to connect to the network
     local result_network="$(_start_network "$profile_number")"
     local result_network_state="$(parse_json_attribute "$result_network" "state")"
@@ -1277,9 +1294,8 @@ function init_modem() {
         else
             _abort_handle "error" "Error starting network: $result_network_state"
             exit 1
-        fi 
+        fi
     fi
-
 
     local counter=0
     while [[ "$(_get_wds_operating_mode 2>/dev/null)" != "connected" ]]; do
@@ -1316,9 +1332,9 @@ function init_modem() {
     local autoconnect_state="enabled" # TODO: Check from where we fetch this info
     local autoconnect_type="home-only"
     if [[ "$no_roaming" == "yes" ]]; then
-        autoconnect_type="home-only";
+        autoconnect_type="home-only"
     else
-        autoconnect_type="roaming-allowed";
+        autoconnect_type="roaming-allowed"
     fi
 
     _set_autoconnect "$autoconnect_state" "$autoconnect_type"
@@ -1356,7 +1372,7 @@ function init_modem() {
 }
 
 # Teardown the modem connection and reset the modem to be used again
-# 
+#
 # Return:
 #   - operating_mode: JSON object with the last operating mode after disconnecting
 function teardown_modem() {
@@ -1373,7 +1389,7 @@ function teardown_modem() {
     fi
 
     local disconnect="$(_stop_network)"
-    
+
     log_msg "info" "Set interface down"
     local is_itf_down=false
     _set_itf_state "down"
@@ -1403,7 +1419,7 @@ function teardown_modem() {
             fi
         done
     fi
-    
+
     while [[ ! $(_get_dms_operating_mode 2>/dev/null) =~ ^(online|low_power|offline|reset)$ ]]; do
         sleep 1
         log_msg "info" "Waiting for modem to be detected again"
@@ -1479,7 +1495,6 @@ function _get_cellular_obj() {
 }
 
 ### END SECTION CONFIG.JSON HANDLING ###
-
 
 while (($#)); do
     case $1 in
