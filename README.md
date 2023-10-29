@@ -20,12 +20,39 @@ Adjust the following constants according to the specific needs of your setup.
 - **_DEBUG_**: When set to `0`, all non-JSON outputs are redirected to the _LOG_FILE_. Conversely, if set to any other value, errors will also be displayed on the console. For production environments, especially when the called application or script relies on JSON parsing, it is imperative to ensure that this is set to `0`.
 - **_DEBUG_LOG_AS_JSON_**: Currently, this feature is not implemented, as it has not found a use case in production environments.
 
-By adhering to these guidelines and making the necessary adjustments to the constants, you can tailor the `modem_control` script to meet the unique requirements of your setup, ensuring functionality.
+By adhering to these guidelines and making the necessary adjustments to the constants, you can tailor the `modem_control` script to meet the unique requirements of your setup, ensuring optimal performance and functionality.
 
 ## Usage
 
+### Command Result Response
+
+Every command executed by the script provides a JSON-formatted response containing the following objects:
+
+- **state**: An object that indicates the status of the command execution.
+  - If the command is executed successfully, `state` is set to `"success"`.
+  - In case of an error, `state` is set to `"error"`, and a descriptive error message is provided.
+- **value**: An object that holds the result of the command. In case of an error, this is set to an empty object.
+
+Example of a successful command execution:
+
+```json
+{
+  "state": {
+    "state": "success",
+    "message": "success"
+  },
+  "value": {}
+}
+```
+
 ### Initialize modem
 
-There are two options to initialize the modem. The standalone mode is used to pass the arguments to the script and the other option is to use a configuration file in JSON format to save the settings and allow persistence settings.
+The modem can be initialized in two different ways: using standalone mode or by employing a configuration file in JSON format. The standalone mode allows for direct argument passing to the script, while the configuration file enables persistent settings.
 
 #### Standalone mode:
+
+To initialize the modem in standalone mode, you can execute the script with the required arguments as shown in the example below:
+
+```bash
+./modem_control -init-modem --mode=standalone --apn=wsim --no-roaming=no --auth=NONE
+```
