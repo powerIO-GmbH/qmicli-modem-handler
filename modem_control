@@ -627,6 +627,13 @@ function _get_signal_info() {
         local rsrq="$(parse_qmicli_result "$result" "RSRQ" " $unit_dB")"
         local rsrp="$(parse_qmicli_result "$result" "RSRP" " $unit_dBm")"
         local snr="$(parse_qmicli_result "$result" "SNR" " $unit_dB")"
+
+        # Assign 0 if variables are empty
+        rssi=${rssi:-0}
+        rsrq=${rsrq:-0}
+        rsrp=${rsrp:-0}
+        snr=${snr:-0}
+
         if [ -n "$snr" ]; then
             snr="$(printf "%.0f" "$snr")" # round SNR
         fi
