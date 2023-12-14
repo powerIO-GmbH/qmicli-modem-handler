@@ -1,0 +1,13 @@
+{
+  "network": {
+    "cellular": {
+      "settings": {
+        "no_roaming": "no",
+        "apn": "wsim",
+        "auth": "NONE",
+        "username": "",
+        "password": ""
+      }
+    }
+  }
+}
