@@ -80,8 +80,8 @@ To initialize the modem in standalone mode, you can execute the script with the 
 ./modem_control -init-modem --mode=standalone --apn=wsim --no-roaming=no --auth=NONE
 ```
 
-<details>
-<summary>Show example output of <i>-init-modem</i></summary>
+
+Show example output of <i>-init-modem</i>
 
 ```json
 {
@@ -170,7 +170,6 @@ To initialize the modem in standalone mode, you can execute the script with the 
 }
 ```
 
-</details>
 <br/>
 
 #### Initialize with config file
@@ -285,8 +284,8 @@ Use the `-teardown-modem` command to disconnect.
     "slot_app_state": "available",
     "application_state": "ready",
     "pin1_state": "disabled",
-    "imsi": "240075813751866",
-    "iccid": "89462038043014770400"
+    "imsi": "<imsi>",
+    "iccid": "<iccid>"
   }
 }
 ```
