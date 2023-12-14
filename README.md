@@ -295,12 +295,12 @@ Use the `-teardown-modem` command to disconnect.
 
 **Get the operating mode information**
 
-<details>
-<summary>Show example output of <i>-get-operating-mode</i></summary>
-
 ```bash
 ./modem_control -get-operating-mode
 ```
+
+<details>
+<summary>Show example output of <i>-get-operating-mode</i></summary>
 
 ```json
 {
