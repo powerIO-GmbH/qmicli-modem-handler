@@ -16,12 +16,12 @@
 - [Notes](#notes)
 
 ## Introduction
-The `modem_control` Bash script is designed to interact with a modem devices.
+The `modem_control` Bash script is designed to interact with a modem device.
 
 ## Features
 - **Modem Initialization**: Configure the modem with tailored settings
 - **Device Information Retrieval**: Easily obtain details about the device.
-- **Network Connection Handling**: Take control of network connections, ensuring reliable and stable connectivity.
+- **Network Connection Handling**: Take control of network connection.
 - **Signal Packet Statistics**: Monitor the signal strength and gather packet statistics.
 - **SIM Card Information**: Access SIM card details.
 
