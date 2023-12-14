@@ -520,7 +520,7 @@ The code of the _modem_control_ is inspired by some other projects.
 **Inspiration:** Used to understand the basic logic for connecting and disconnecting 
 
 **Source:** https://github.com/lf-edge/eve - EVE is Edge Virtualization Engine  
-**Description:** Open edge device logics for virtualization
+**Description:** Open edge device logics for virtualization  
 **Main parts:** https://github.com/lf-edge/eve/blob/10.11/pkg/wwan/usr/bin/wwan-init.sh  
 **Notes:** The WWAN Modem handling in bash is only available for versions `< 11.0`  
 **Inspiration:**  Used to understand complex handling of the modem.  
