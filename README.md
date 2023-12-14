@@ -13,13 +13,14 @@
     - [Disconnect (Teardown) modem](#disconnect-teardown-modem)
     - [Device and SIM info](#device-and-sim-info)
     - [Signal and network Info](#signal-and-network-info)
+- [Notes](#notes)
 
 ## Introduction
-The `modem_control` Bash script is designed to interactions with a modem devices.
+The `modem_control` Bash script is designed to interact with a modem devices.
 
 ## Features
 - **Modem Initialization**: Configure the modem with tailored settings
-- **Device Information Retrieval**: Obtain details about the device to have a better understanding of its characteristics and status.
+- **Device Information Retrieval**: Easily obtain details about the device.
 - **Network Connection Handling**: Take control of network connections, ensuring reliable and stable connectivity.
 - **Signal Packet Statistics**: Monitor the signal strength and gather packet statistics.
 - **SIM Card Information**: Access SIM card details.
@@ -509,3 +510,19 @@ Use the `-teardown-modem` command to disconnect.
 
 </details>
 <br/>
+
+# Notes
+
+The code of the _modem_control_ is inspired by some other projects.
+
+**Source:** https://github.com/mikeloveapple2/qmi_dial_script  
+**Description:** A simple bash script to setup a mobile connection  
+**Main parts:** https://github.com/mikeloveapple2/qmi_dial_script/blob/master/redial.sh  
+**Inspiration:** Used to understand the basic logic for connecting and disconnecting 
+
+**Source:** https://github.com/lf-edge/eve - EVE is Edge Virtualization Engine  
+**Description:** Open edge device logics for virtualization
+**Main parts:** https://github.com/lf-edge/eve/blob/10.11/pkg/wwan/usr/bin/wwan-init.sh  
+**Notes:** The WWAN Modem handling in bash is only available for versions `< 11.0`  
+**Inspiration:**  Used to understand complex handling of the modem.  
+This project inspired us to use the json parsing logic to call the _modem_control_ from other programs and handle the output in JSON format.
